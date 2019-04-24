@@ -1,6 +1,6 @@
 /******************************************************************************
  * Named Data Networking plugin for xrootd                                    *
- * Copyright © 2018 California Institute of Technology                        *
+ * Copyright © 2018-2019 California Institute of Technology                   *
  *                                                                            *
  * Author: Catalin Iordache <catalin.iordache@cern.ch>                        *
  *                                                                            *
@@ -21,31 +21,28 @@
 #ifndef XRDNDN_PRODUCER_HH
 #define XRDNDN_PRODUCER_HH
 
-#include <boost/asio/basic_waitable_timer.hpp>
-#include <boost/noncopyable.hpp>
-#include <chrono>
 #include <ndn-cxx/face.hpp>
 
-#include "../common/xrdndn-thread-safe-umap.hh"
-#include "xrdndn-file-handler.hh"
+#include <boost/noncopyable.hpp>
 
-using boost::noncopyable;
+#include "xrdndn-interest-manager.hh"
+#include "xrdndn-producer-options.hh"
 
 namespace xrdndnproducer {
-class Producer : noncopyable {
-    typedef boost::asio::basic_waitable_timer<std::chrono::system_clock>
-        system_timer;
-
+class Producer : boost::noncopyable {
   public:
-    Producer(ndn::Face &face);
+    static std::shared_ptr<Producer>
+    getXrdNdnProducerInstance(ndn::Face &face, const Options &opts);
+
+    Producer(ndn::Face &face, const Options &opts);
     ~Producer();
 
   private:
+    void registerPrefix();
+    void onData(std::shared_ptr<ndn::Data> data);
+
     void onOpenInterest(const ndn::InterestFilter &,
                         const ndn::Interest &interest);
-
-    void onCloseInterest(const ndn::InterestFilter &,
-                         const ndn::Interest &interest);
 
     void onFstatInterest(const ndn::InterestFilter &,
                          const ndn::Interest &interest);
@@ -53,24 +50,16 @@ class Producer : noncopyable {
     void onReadInterest(const ndn::InterestFilter &,
                         const ndn::Interest &interest);
 
-    void onGarbageCollector();
-
   private:
     ndn::Face &m_face;
+    bool m_error;
 
-    xrdndn::ThreadSafeUMap<std::string, std::shared_ptr<FileHandler>>
-        m_FileHandlers;
-    std::shared_ptr<Packager> m_packager;
-    std::shared_ptr<system_timer> m_GarbageCollectorTimer;
+    ndn::RegisteredPrefixHandle m_xrdndnPrefixHandle;
+    ndn::InterestFilterHandle m_openFilterHandle;
+    ndn::InterestFilterHandle m_fstatFilterHandle;
+    ndn::InterestFilterHandle m_readFilterHandle;
 
-    const ndn::RegisteredPrefixId *m_xrdndnPrefixId;
-    const ndn::InterestFilterId *m_OpenFilterId;
-    const ndn::InterestFilterId *m_CloseFilterId;
-    const ndn::InterestFilterId *m_FstatFilterId;
-    const ndn::InterestFilterId *m_ReadFilterId;
-
-    void registerPrefix();
-    bool setFileHandler(std::string path);
+    std::shared_ptr<InterestManager> m_interestManager;
 };
 
 } // namespace xrdndnproducer

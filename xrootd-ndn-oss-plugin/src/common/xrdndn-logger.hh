@@ -27,12 +27,37 @@
 #endif
 
 #include <ndn-cxx/util/logger.hpp>
+#include <ndn-cxx/util/logging.hpp>
 
 namespace xrdndnconsumer {
+/**
+ * @brief Application is using ndn-log as logging module. This is the name of
+ * the logging module for XRootD NDN Consumer. More information can be found at
+ * https://named-data.net/doc/ndn-cxx/current/manpages/ndn-log.html
+ *
+ */
+#define CONSUMER_LOGGER_PREFIX "xrdndnconsumer"
+
+/**
+ * @brief Initialize ndn-log module xrdndnconsumer
+ *
+ */
 NDN_LOG_INIT(xrdndnconsumer);
 } // namespace xrdndnconsumer
 
 namespace xrdndnproducer {
+/**
+ * @brief Application is using ndn-log as logging module. This is the name of
+ * the logging module for XRootD NDN Producer. More information can be found at
+ * https://named-data.net/doc/ndn-cxx/current/manpages/ndn-log.html
+ *
+ */
+#define PRODUCER_LOGGER_PREFIX "xrdndnproducer"
+
+/**
+ * @brief Initialize ndn-log module xrdndnproducer
+ *
+ */
 NDN_LOG_INIT(xrdndnproducer);
 } // namespace xrdndnproducer
 

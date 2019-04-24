@@ -1,6 +1,6 @@
 /******************************************************************************
  * Named Data Networking plugin for xrootd                                    *
- * Copyright © 2018 California Institute of Technology                        *
+ * Copyright © 2018-2019 California Institute of Technology                   *
  *                                                                            *
  * Author: Catalin Iordache <catalin.iordache@cern.ch>                        *
  *                                                                            *
@@ -21,25 +21,30 @@
 #ifndef XRDNDN_PACKAGER
 #define XRDNDN_PACKAGER
 
-#include <boost/thread/shared_mutex.hpp>
 #include <ndn-cxx/face.hpp>
 
 namespace xrdndnproducer {
-class Packager {
+class Packager : public std::enable_shared_from_this<Packager> {
+    static const ndn::security::SigningInfo signingInfo;
+    static const std::shared_ptr<ndn::KeyChain> keyChain;
+
   public:
-    Packager();
+    Packager(uint64_t freshnessPeriod, bool disableSignature = false);
     ~Packager();
 
-    std::shared_ptr<ndn::Data> getPackage(const ndn::Name &name, int value);
+    std::shared_ptr<ndn::Data> getPackage(ndn::Name &name,
+                                          const int contentValue);
     std::shared_ptr<ndn::Data> getPackage(ndn::Name &name, const uint8_t *value,
                                           ssize_t size);
 
   private:
-    void digest(std::shared_ptr<ndn::Data> &data);
+    void digest(std::shared_ptr<ndn::Data> data);
 
   private:
-    ndn::KeyChain m_keyChain;
-    mutable boost::shared_mutex m_mutex;
+    const ndn::time::milliseconds m_freshnessPeriod;
+
+    bool m_disableSigning;
+    ndn::Signature m_fakeSignature;
 };
 } // namespace xrdndnproducer
 

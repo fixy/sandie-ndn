@@ -21,61 +21,68 @@
 #ifndef XRDNDN_UTILS_HH
 #define XRDNDN_UTILS_HH
 
-#include <cstring>
-#include <ndn-cxx/face.hpp>
-#include <ndn-cxx/util/logger.hpp>
+#include <iostream>
 
-#include "xrdndn-dfh-interface.hh"
-#include "xrdndn-namespaces.hh"
+#include <ndn-cxx/name.hpp>
+
+#include "xrdndn-namespace.hh"
 
 namespace xrdndn {
 class Utils {
   public:
-    // NDN Interest specific helper functions //
-
-    // Returns Name prefix for a system call
-    static ndn::Name interestPrefix(SystemCalls sc) {
-        return ndn::Name(PLUGIN_INTEREST_PREFIX_URI).append(enumToString(sc));
-    }
-    // Returns Name for a give system call on a file at path
-    static ndn::Name interestName(SystemCalls sc, std::string path) {
-        return interestPrefix(sc).append(path);
-    }
-
-    // NDN Name specific helper functions //
-
-    // Returns file path from the ndn::Name for a specific system call
-    static std::string getFilePathFromName(ndn::Name name, SystemCalls sc) {
-        std::string ret;
-
-        switch (sc) {
-        case SystemCalls::read: {
-            size_t nPrefixSz = interestPrefix(sc).size();
-            size_t nComponents = name.size() - nPrefixSz - 1;
-            ret = name.getSubName(nPrefixSz, nComponents).toUri();
-            break;
-        }
-        case SystemCalls::open:
-        case SystemCalls::close:
-        case SystemCalls::fstat:
-        default:
-            ret = name.getSubName(interestPrefix(sc).size(), ndn::Name::npos)
-                      .toUri();
-            break;
-        }
-
-        return ret;
+    /**
+     * @brief Get the Name object for a prefix, a file name and a segment number
+     *
+     * @param prefix The prefix of the Name
+     * @param path The file path
+     * @param segmentNo The segment number
+     * @return ndn::Name The resulting NDN Name
+     */
+    static ndn::Name getName(ndn::Name prefix, std::string path,
+                             uint64_t segmentNo = 0) noexcept {
+        return prefix == SYS_CALL_READ_PREFIX_URI
+                   ? prefix.append(path).appendSegment(segmentNo)
+                   : prefix.append(path);
     }
 
-    // Returns segment number for read file system call specific request
-    template <typename Packet>
-    static uint64_t getSegmentFromPacket(const Packet &packet) {
-        ndn::Name name = packet.getName();
-
-        if (name.at(-1).isVersion()) {
-            return name.at(-2).toSegment();
+    /**
+     * @brief Get the file name from an Interest Name
+     *
+     * @param name The Name
+     * @return std::string The file name as a std::string
+     */
+    static std::string getPath(const ndn::Name &name) noexcept {
+        try {
+            if (name.at(-1).isSegment())
+                return name.getSubName(xrdndn::SYS_CALLS_PREFIX_LEN)
+                    .getPrefix(-1)
+                    .toUri();
+        } catch (ndn::Name::Error &error) {
+            std::cerr << "Unable to get file path from Name: " << name
+                      << std::endl;
+            return std::string();
         }
-        return name.at(-1).toSegment();
+        return name.getSubName(xrdndn::SYS_CALLS_PREFIX_LEN).toUri();
+    }
+
+    /**
+     * @brief Get segment number from Name
+     *
+     * @param name Name
+     * @return uint64_t Segment number
+     */
+    static uint64_t getSegmentNo(const ndn::Name &name) noexcept {
+        try {
+            if (name.at(-1).isSegment())
+                return name.at(-1).toSegment();
+            else if (name.at(-1).isVersion())
+                return name.at(-2).toSegment();
+        } catch (ndn::Name::Error &error) {
+            std::cerr << "Unable to get segment number from name: " << name
+                      << std::endl;
+        }
+
+        return 0;
     }
 };
 } // namespace xrdndn

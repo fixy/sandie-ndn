@@ -1,6 +1,6 @@
 /******************************************************************************
  * Named Data Networking plugin for xrootd                                    *
- * Copyright © 2018 California Institute of Technology                        *
+ * Copyright © 2018-2019 California Institute of Technology                   *
  *                                                                            *
  * Author: Catalin Iordache <catalin.iordache@cern.ch>                        *
  *                                                                            *
@@ -18,8 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.     *
  *****************************************************************************/
 
-#include <functional>
-#include <iostream>
+#include <algorithm>
 
 #include "../common/xrdndn-logger.hh"
 #include "../common/xrdndn-utils.hh"
@@ -28,318 +27,279 @@
 using namespace ndn;
 
 namespace xrdndnconsumer {
-Consumer::Consumer()
-    : m_scheduler(m_face.getIoService()),
-      m_validator(security::v2::getAcceptAllValidator()), m_nTimeouts(0),
-      m_nNacks(0), m_buffOffset(XRDNDN_ESUCCESS), m_retOpen(XRDNDN_EFAILURE),
-      m_retClose(XRDNDN_EFAILURE), m_retFstat(XRDNDN_EFAILURE),
-      m_retRead(XRDNDN_ESUCCESS) {
-    m_bufferedData.clear();
+std::shared_ptr<Consumer>
+Consumer::getXrdNdnConsumerInstance(const Options &opts) {
+    auto consumer = std::make_shared<Consumer>(opts);
+
+    if (!consumer || consumer->m_error) {
+        NDN_LOG_FATAL("Unable to get XRootD NDN Consumer object instance");
+        return nullptr;
+    }
+
+    return consumer;
+}
+
+Consumer::Consumer(const Options &opts)
+    : m_options(opts), m_interestLifetime(opts.interestLifetime),
+      m_validator(security::v2::getAcceptAllValidator()), m_error(false) {
+    setLogLevel();
+    NDN_LOG_TRACE("Alloc XRootD NDN Consumer");
+
+    m_pipeline = std::make_shared<Pipeline>(m_face, m_options.pipelineSize);
+    if (!m_pipeline) {
+        m_error = true;
+        NDN_LOG_ERROR("Unable to get Pipeline object instance");
+        return;
+    }
+
+    processEvents(false);
+
+    if (!m_error) {
+        faceProcessEventsThread =
+            boost::thread(std::bind(&Consumer::processEvents, this, true));
+    }
 }
 
 Consumer::~Consumer() {
+    if (m_pipeline)
+        m_pipeline->stop();
+
     m_face.removeAllPendingInterests();
-    m_scheduler.cancelAllEvents();
     m_face.shutdown();
-
-    this->flush();
+    faceProcessEventsThread.join();
 }
 
-// Reset all class members.
-void Consumer::flush() {
-    m_bufferedData.clear();
-    m_retOpen = XRDNDN_EFAILURE;
-    m_retClose = XRDNDN_EFAILURE;
-    m_retFstat = XRDNDN_EFAILURE;
-    m_retRead = XRDNDN_ESUCCESS;
-    m_nTimeouts = 0;
-    m_nNacks = 0;
-    m_buffOffset = XRDNDN_ESUCCESS;
+void Consumer::setLogLevel() {
+    try {
+        ndn::util::Logging::setLevel(CONSUMER_LOGGER_PREFIX "=" +
+                                     m_options.logLevel);
+    } catch (const std::invalid_argument &e) {
+        std::cerr << "Catch exception: " << e.what()
+                  << ". The log level will be set to implicit value NONE"
+                  << std::endl;
+        ndn::util::Logging::setLevel(CONSUMER_LOGGER_PREFIX "=NONE");
+    }
 }
 
-// Return an interest for the given name.
-const Interest Consumer::composeInterest(const Name name) {
+void Consumer::processEvents(bool keepThread) {
+    try {
+        m_face.processEvents(time::milliseconds::zero(), keepThread);
+    } catch (const std::exception &e) {
+        NDN_LOG_ERROR("Catch exception: "
+                      << e.what() << " while processing NDN face events");
+        m_error = true;
+        m_pipeline->stop();
+    }
+}
+
+const Interest Consumer::getInterest(ndn::Name prefix, uint64_t segmentNo) {
+    auto name = xrdndn::Utils::getName(prefix, m_path, segmentNo);
+
     Interest interest(name);
-    interest.setInterestLifetime(DEFAULT_INTEREST_LIFETIME);
+    interest.setInterestLifetime(m_interestLifetime);
     interest.setMustBeFresh(true);
+    interest.setDefaultCanBePrefix(false);
     return interest;
 }
 
-// Express interest on face for a given system call.
-void Consumer::expressInterest(const Interest &interest,
-                               const xrdndn::SystemCalls call) {
-    std::function<void(const Interest &interest, const Data &data)> onData;
-    switch (call) {
-    case (xrdndn::SystemCalls::open):
-        onData = bind(&Consumer::onOpenData, this, _1, _2);
-        break;
-    case (xrdndn::SystemCalls::close):
-        onData = bind(&Consumer::onCloseData, this, _1, _2);
-        break;
-    case (xrdndn::SystemCalls::read):
-        onData = bind(&Consumer::onReadData, this, _1, _2);
-        break;
-    case (xrdndn::SystemCalls::fstat):
-        onData = bind(&Consumer::onFstatData, this, _1, _2);
-        break;
-    default:
-        return;
+int Consumer::validateData(const int errcode, const Interest &interest,
+                           const Data &data) {
+    NDN_LOG_TRACE("Validating Data for Interest: " << interest);
+
+    if (errcode != XRDNDN_ESUCCESS) {
+        NDN_LOG_ERROR("Error occured while procesing Interest: " << interest);
+        return errcode;
     }
 
-    m_face.expressInterest(interest, onData,
-                           bind(&Consumer::onNack, this, _1, _2, call),
-                           bind(&Consumer::onTimeout, this, _1, call));
-}
+    int retValidate = XRDNDN_ESUCCESS;
+    m_validator.validate(
+        data,
+        [&](const Data &data) {
+            if (data.getContentType() == ndn::tlv::ContentType_Nack) {
+                NDN_LOG_ERROR("Received application level NACK for Interest: "
+                              << interest);
+                retValidate = -readNonNegativeInteger(data.getContent());
+            }
+        },
+        [&](const Data &, const security::v2::ValidationError &error) {
+            NDN_LOG_ERROR("Error: " << error.getInfo()
+                                    << " while validating Data for Interest: "
+                                    << interest);
+            retValidate = XRDNDN_EFAILURE;
+        });
 
-// Process any data to receive and exit gracefully
-int Consumer::processEvents() {
-    try {
-        m_face.processEvents();
-    } catch (const std::exception &e) {
-        NDN_LOG_ERROR(e.what());
-        return XRDNDN_EFAILURE;
-    }
-    return XRDNDN_ESUCCESS;
-}
-
-// On NACK, the interest will be send again for MAX_ENTRIES times o DUPLICATE
-// or CONGESTION reasons.
-void Consumer::onNack(const Interest &interest, const lp::Nack &nack,
-                      const xrdndn::SystemCalls call) {
-    NDN_LOG_TRACE("NACK with reason: " << nack.getReason() << " for interest "
-                                       << interest);
-    if (m_nNacks >= MAX_RETRIES) {
-        NDN_LOG_WARN("Reached the maximum number of nack retries: "
-                     << m_nNacks << " while retrieving Data for: " << interest);
-        return;
-    } else {
-        ++m_nNacks;
-    }
-
-    Interest newInterest(interest);
-    newInterest.refreshNonce();
-
-    switch (nack.getReason()) {
-    case lp::NackReason::DUPLICATE:
-        NDN_LOG_TRACE("Resending interest: " << interest);
-        m_scheduler.scheduleEvent(
-            DUPLICATE_BACKOFF,
-            bind(&Consumer::expressInterest, this, interest, call));
-        break;
-    case lp::NackReason::CONGESTION:
-        NDN_LOG_TRACE("Resending interest: " << interest);
-        m_scheduler.scheduleEvent(
-            CONGESTION_BACKOFF,
-            bind(&Consumer::expressInterest, this, interest, call));
-        break;
-    default:
-        NDN_LOG_WARN("NACK with reason: "
-                     << nack.getReason()
-                     << " does not trigger a retry for interest: " << interest);
-        break;
-    }
-}
-
-// On timeout, retry for MAX_RETRIES times
-void Consumer::onTimeout(const Interest &interest,
-                         const xrdndn::SystemCalls call) {
-    NDN_LOG_TRACE("Timeout for interest: " << interest);
-
-    if (m_nTimeouts >= MAX_RETRIES) {
-        NDN_LOG_WARN("Reached the maximum number of timeout retries: "
-                     << m_nTimeouts
-                     << " while retrieving Data for: " << interest);
-        return;
-    } else {
-        ++m_nTimeouts;
-    }
-
-    Interest newInterest(interest);
-    newInterest.refreshNonce();
-
-    NDN_LOG_TRACE("Resending interest: " << interest);
-    m_scheduler.scheduleEvent(TIMEOUT_BACKOFF, bind(&Consumer::expressInterest,
-                                                    this, interest, call));
+    return retValidate;
 }
 
 /*****************************************************************************/
 /*                                  O p e n                                  */
 /*****************************************************************************/
-void Consumer::onOpenData(const Interest &interest, const Data &data) {
-    m_validator.validate(
-        data,
-        [this, interest](const Data &data) {
-            m_retOpen = this->getIntegerFromData(data);
-            NDN_LOG_TRACE("Open file: " << interest
-                                        << " with error code: " << m_retOpen);
-        },
-        [](const Data &, const security::v2::ValidationError &error) {
-            NDN_LOG_ERROR(
-                "Error while validating Data for open: " << error.getInfo());
-        });
-}
-
 int Consumer::Open(std::string path) {
-    Interest openInterest = this->composeInterest(
-        xrdndn::Utils::interestName(xrdndn::SystemCalls::open, path));
-    this->expressInterest(openInterest, xrdndn::SystemCalls::open);
+    if (path.empty()) {
+        NDN_LOG_ERROR("File path is empty");
+        m_error = true;
+        return -ENOENT;
+    }
+    m_path = path;
 
-    NDN_LOG_TRACE("Sending open file interest: " << openInterest);
-    if (this->processEvents()) {
-        return XRDNDN_EFAILURE;
+    auto openInterest = this->getInterest(xrdndn::SYS_CALL_OPEN_PREFIX_URI);
+
+    NDN_LOG_INFO("Request open file: " << m_path
+                                       << " with Interest: " << openInterest);
+
+    FutureType future = m_pipeline->insert(openInterest);
+    if (!future.valid()) {
+        NDN_LOG_ERROR("Received invalid future for open request");
+        return -ECONNABORTED;
     }
 
-    return m_retOpen;
+    try {
+        future.wait();
+    } catch (const std::exception &e) {
+        NDN_LOG_ERROR("Catch exception: "
+                      << e.what()
+                      << " while waiting for future on open request");
+        return -ECONNABORTED;
+    }
+
+    DataTypeTuple openResult = future.get();
+    int retOpen = validateData(std::get<0>(openResult), std::get<1>(openResult),
+                               std::get<2>(openResult));
+
+    if (retOpen == XRDNDN_ESUCCESS) {
+        retOpen = -readNonNegativeInteger(std::get<2>(openResult).getContent());
+    }
+
+    NDN_LOG_INFO("Open file: " << m_path << " with error code: " << retOpen);
+
+    return retOpen;
 }
 
 /*****************************************************************************/
 /*                                 C l o s e                                 */
 /*****************************************************************************/
-void Consumer::onCloseData(const Interest &interest, const Data &data) {
-    m_validator.validate(
-        data,
-        [this, interest](const Data &data) {
-            m_retClose = this->getIntegerFromData(data);
-            NDN_LOG_TRACE("Close file: " << interest
-                                         << " with error code: " << m_retClose);
-        },
-        [](const Data &, const security::v2::ValidationError &error) {
-            NDN_LOG_ERROR(
-                "Error while validating Data for close: " << error.getInfo());
-        });
-}
-
-int Consumer::Close(std::string path) {
-    Interest openInterest = this->composeInterest(
-        xrdndn::Utils::interestName(xrdndn::SystemCalls::close, path));
-    this->expressInterest(openInterest, xrdndn::SystemCalls::close);
-
-    NDN_LOG_TRACE("Sending close file interest: " << openInterest);
-    if (this->processEvents()) {
-        return XRDNDN_EFAILURE;
-    }
-
-    return m_retClose;
+int Consumer::Close() {
+    NDN_LOG_INFO("Close file: " << m_path << " with error code: 0");
+    m_pipeline->getStatistics(m_path);
+    return XRDNDN_ESUCCESS;
 }
 
 /*****************************************************************************/
 /*                                F s t a t                                  */
 /*****************************************************************************/
-void Consumer::onFstatData(const ndn::Interest &interest,
-                           const ndn::Data &data) {
-    NDN_LOG_TRACE("Received data for fstat: " << interest);
+int Consumer::Fstat(struct stat *buff) {
+    auto fstatInterest = this->getInterest(xrdndn::SYS_CALL_FSTAT_PREFIX_URI);
 
-    auto dataPtr = data.shared_from_this();
-    m_validator.validate(
-        data,
-        [this, dataPtr, interest](const Data &data) {
-            if (data.getContentType() == xrdndn::tlv::negativeInteger) {
-                m_face.shutdown();
-            } else {
-                m_retFstat = XRDNDN_ESUCCESS;
-                m_bufferedData[0] = dataPtr;
-            }
-        },
-        [](const Data &, const security::v2::ValidationError &error) {
-            NDN_LOG_ERROR(
-                "Error while validating Data for fstat: " << error.getInfo());
-        });
-}
+    NDN_LOG_INFO("Request fstat for file: " << m_path << " with Interest: "
+                                            << fstatInterest);
 
-int Consumer::Fstat(struct stat *buff, std::string path) {
-    this->flush();
-
-    Interest fstatInterest = this->composeInterest(
-        xrdndn::Utils::interestName(xrdndn::SystemCalls::fstat, path));
-    this->expressInterest(fstatInterest, xrdndn::SystemCalls::fstat);
-
-    NDN_LOG_TRACE("Sending fstat interest: " << fstatInterest);
-    if (this->processEvents()) {
-        return XRDNDN_EFAILURE;
+    FutureType future = m_pipeline->insert(fstatInterest);
+    if (!future.valid()) {
+        NDN_LOG_ERROR("Received invalid future for fstat request");
+        return -ECONNABORTED;
     }
 
-    this->saveDataInOrder(buff, 0, sizeof(struct stat));
-    return m_retFstat;
+    try {
+        future.wait();
+    } catch (const std::exception &e) {
+        NDN_LOG_ERROR("Catch exception: "
+                      << e.what()
+                      << " while waiting for future on fstat request");
+        return -ECONNABORTED;
+    }
+
+    DataTypeTuple fstatResult = future.get();
+    int retFstat =
+        validateData(std::get<0>(fstatResult), std::get<1>(fstatResult),
+                     std::get<2>(fstatResult));
+
+    if (retFstat == XRDNDN_ESUCCESS) {
+        memcpy((uint8_t *)buff, std::get<2>(fstatResult).getContent().value(),
+               sizeof(struct stat));
+    }
+
+    NDN_LOG_INFO("Fstat file: " << m_path << " with error code: " << retFstat);
+
+    return retFstat;
 }
 
 /*****************************************************************************/
 /*                                  R e a d                                  */
 /*****************************************************************************/
-void Consumer::onReadData(const ndn::Interest &interest,
-                          const ndn::Data &data) {
-    NDN_LOG_TRACE("Received data for read: " << interest);
-    auto dataPtr = data.shared_from_this();
-    m_validator.validate(
-        data,
-        [this, dataPtr](const Data &data) {
-            if (data.getContentType() == xrdndn::tlv::negativeInteger) {
-                m_retRead = XRDNDN_EFAILURE;
-                m_face.shutdown();
-            } else {
-                m_bufferedData[xrdndn::Utils::getSegmentFromPacket(data)] =
-                    dataPtr;
-            }
-        },
-        [](const Data &, const security::v2::ValidationError &error) {
-            NDN_LOG_ERROR(
-                "Error while validating Data for read: " << error.getInfo());
-        });
-}
+ssize_t Consumer::Read(void *buff, off_t offset, size_t blen) {
+    NDN_LOG_TRACE("Reading " << blen << " bytes @" << offset
+                             << " from file: " << m_path);
 
-ssize_t Consumer::Read(void *buff, off_t offset, size_t blen,
-                       std::string path) {
-    this->flush();
-    uint64_t firstSegment = offset / XRDNDN_MAX_NDN_PACKET_SIZE;
+    off_t firstSegmentIdx = offset / XRDNDN_MAX_NDN_PACKET_SIZE;
+    off_t lastSegmentIdx =
+        ceil((offset + blen) / static_cast<double>(XRDNDN_MAX_NDN_PACKET_SIZE));
 
-    int noSegments = blen / XRDNDN_MAX_NDN_PACKET_SIZE;
-    uint64_t lastSegment = firstSegment + noSegments;
-    if (noSegments != 0)
-        ++lastSegment;
+    std::vector<FutureType> futures;
+    for (auto i = firstSegmentIdx; i < lastSegmentIdx; ++i) {
+        auto future = m_pipeline->insert(
+            getInterest(xrdndn::SYS_CALL_READ_PREFIX_URI, i));
 
-    for (auto i = firstSegment; i <= lastSegment; ++i) {
-        Name name =
-            xrdndn::Utils::interestName(xrdndn::SystemCalls::read, path);
-        name.appendSegment(i); // segment no.
-
-        Interest readInterest = this->composeInterest(name);
-        this->expressInterest(readInterest, xrdndn::SystemCalls::read);
-
-        NDN_LOG_TRACE("Sending read file interest: " << readInterest);
-
-        if (this->processEvents()) {
-            return XRDNDN_EFAILURE;
+        if (future.valid()) {
+            futures.push_back(std::move(future));
+        } else {
+            NDN_LOG_ERROR("Received invalid future for read request");
+            return -ECONNABORTED;
         }
     }
 
-    this->saveDataInOrder(buff, offset, blen);
-    return m_retRead == XRDNDN_ESUCCESS ? m_buffOffset : XRDNDN_EFAILURE;
+    std::map<uint64_t, const ndn::Block> dataStore;
+    for (auto it = futures.begin(); it != futures.end(); ++it) {
+        try {
+            auto readResult = it->get();
+            auto retRead =
+                validateData(std::get<0>(readResult), std::get<1>(readResult),
+                             std::get<2>(readResult));
+
+            if (retRead != XRDNDN_ESUCCESS) {
+                return retRead;
+            }
+            dataStore.insert(std::pair<uint64_t, const Block>(
+                xrdndn::Utils::getSegmentNo(std::get<2>(readResult).getName()),
+                std::get<2>(readResult).getContent()));
+        } catch (const std::exception &e) {
+            NDN_LOG_ERROR("Catch exception: "
+                          << e.what()
+                          << " while waiting for future on read request");
+            return -ECONNABORTED;
+        }
+    }
+
+    auto retRead = this->returnData(buff, offset, blen, std::ref(dataStore));
+    NDN_LOG_TRACE("Received read Data for " << blen << " bytes @" << offset
+                                            << " from file: " << m_path
+                                            << " with ret: " << retRead);
+
+    return retRead;
 }
 
-// Store data received from producer.
-void Consumer::saveDataInOrder(void *buff, off_t offset, size_t blen) {
-    size_t leftToSave = blen;
-    auto storeInBuff = [&](const Block &content, off_t contentOffset) {
-        size_t len = content.value_size() - contentOffset;
-        len = len < leftToSave ? len : leftToSave;
-        leftToSave -= len;
+// todo: make this better, without map and shit
+inline size_t
+Consumer::returnData(void *buff, off_t offset, size_t blen,
+                     std::map<uint64_t, const ndn::Block> &dataStore) {
+    size_t nBytes = 0;
 
-        memcpy((uint8_t *)buff + m_buffOffset, content.value() + contentOffset,
-               len);
-        m_buffOffset += len;
+    auto putData = [&](const Block &content, size_t contentoff) {
+        auto len = std::min(content.value_size() - contentoff, blen);
+        memcpy((uint8_t *)buff + nBytes, content.value() + contentoff, len);
+        nBytes += len;
+        blen -= len;
     };
 
-    for (auto it = m_bufferedData.begin(); it != m_bufferedData.end();
-         it = m_bufferedData.erase(it)) {
-        const Block &content = it->second->getContent();
+    auto it = dataStore.begin();
+    // Store first bytes in buffer from offset
+    putData(it->second, offset % XRDNDN_MAX_NDN_PACKET_SIZE);
+    it = dataStore.erase(it);
 
-        if (m_buffOffset == 0) { // Store first chunk
-            size_t contentOffset = offset % XRDNDN_MAX_NDN_PACKET_SIZE;
-            if (contentOffset >= content.value_size())
-                return;
-            storeInBuff(content, contentOffset);
-        } else {
-            storeInBuff(content, 0);
-        }
+    // Store rest of bytes until end
+    for (; it != dataStore.end(); it = dataStore.erase(it)) {
+        putData(it->second, 0);
     }
+
+    return nBytes;
 }
 } // namespace xrdndnconsumer

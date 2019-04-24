@@ -1,6 +1,6 @@
 /******************************************************************************
  * Named Data Networking plugin for xrootd                                    *
- * Copyright © 2018 California Institute of Technology                        *
+ * Copyright © 2018-2019 California Institute of Technology                   *
  *                                                                            *
  * Author: Catalin Iordache <catalin.iordache@cern.ch>                        *
  *                                                                            *
@@ -18,227 +18,112 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.     *
  *****************************************************************************/
 
-#include <iostream>
-
-#include "../common/xrdndn-common.hh"
-#include "../common/xrdndn-logger.hh"
-#include "../common/xrdndn-utils.hh"
 #include "xrdndn-producer.hh"
+#include "../common/xrdndn-logger.hh"
+#include "../common/xrdndn-namespace.hh"
 
 using namespace ndn;
-using namespace xrdndn;
 
 namespace xrdndnproducer {
+std::shared_ptr<Producer>
+Producer::getXrdNdnProducerInstance(Face &face, const Options &opts) {
+    auto producer = std::make_shared<Producer>(face, opts);
+    if (!producer || producer->m_error) {
+        NDN_LOG_FATAL("Unable to get XRootD NDN Producer object instance");
+        return nullptr;
+    }
 
-Producer::Producer(Face &face)
-    : m_face(face), m_OpenFilterId(nullptr), m_CloseFilterId(nullptr),
-      m_ReadFilterId(nullptr) {
+    return producer;
+}
 
-    NDN_LOG_TRACE("Alloc xrdndn::Producer");
+Producer::Producer(Face &face, const Options &opts)
+    : m_face(face), m_error(false) {
+    NDN_LOG_TRACE("Alloc XRootD NDN Producer");
+
+    try {
+        m_face.processEvents();
+    } catch (const std::exception &e) {
+        m_error = true;
+        NDN_LOG_ERROR(e.what());
+        return;
+    }
+
+    m_interestManager = std::make_shared<InterestManager>(
+        opts, std::bind(&Producer::onData, this, _1));
+
+    if (!m_interestManager) {
+        NDN_LOG_FATAL("Unable to get Interest Manager object instance");
+        m_error = true;
+        return;
+    }
+
     this->registerPrefix();
-    m_packager = std::make_shared<Packager>();
-    m_GarbageCollectorTimer =
-        std::make_shared<system_timer>(m_face.getIoService());
-    m_GarbageCollectorTimer->async_wait(
-        std::bind(&Producer::onGarbageCollector, this));
 }
 
 Producer::~Producer() {
-    if (m_xrdndnPrefixId != nullptr) {
-        m_face.unsetInterestFilter(m_xrdndnPrefixId);
-    }
-    if (m_OpenFilterId != nullptr) {
-        m_face.unsetInterestFilter(m_OpenFilterId);
-    }
-    if (m_CloseFilterId != nullptr) {
-        m_face.unsetInterestFilter(m_CloseFilterId);
-    }
-    if (m_FstatFilterId != nullptr) {
-        m_face.unsetInterestFilter(m_FstatFilterId);
-    }
-    if (m_ReadFilterId != nullptr) {
-        m_face.unsetInterestFilter(m_ReadFilterId);
-    }
-
-    m_GarbageCollectorTimer->cancel();
+    m_xrdndnPrefixHandle.cancel();
+    m_openFilterHandle.cancel();
+    m_fstatFilterHandle.cancel();
+    m_readFilterHandle.cancel();
     m_face.shutdown();
-    m_FileHandlers.clear();
 }
 
 // Register all interest filters that this producer will answer to
 void Producer::registerPrefix() {
-    NDN_LOG_TRACE("Register prefixes.");
-
-    // For nfd
-    m_xrdndnPrefixId = m_face.registerPrefix(
-        Name(PLUGIN_INTEREST_PREFIX_URI),
+    m_xrdndnPrefixHandle = m_face.registerPrefix(
+        xrdndn::SYS_CALLS_PREFIX_URI,
         [](const Name &name) {
-            NDN_LOG_INFO("Successfully registered prefix for: " << name);
+            NDN_LOG_INFO("Successfully registered Interest prefix: "
+                         << name << " with connected NDN forwarder");
         },
-        [](const Name &name, const std::string &msg) {
-            NDN_LOG_FATAL("Could not register " << name
-                                                << " prefix for nfd: " << msg);
+        [this](const Name &name, const std::string &msg) {
+            m_error = true;
+            NDN_LOG_FATAL("Could not register Interest prefix: "
+                          << name << " with connected NDN forwarder: " << msg);
         });
 
-    // Filter for open system call
-    m_OpenFilterId =
-        m_face.setInterestFilter(Utils::interestPrefix(SystemCalls::open),
-                                 bind(&Producer::onOpenInterest, this, _1, _2));
-    if (!m_OpenFilterId) {
-        NDN_LOG_FATAL("Could not set interest filter for open systemcall.");
-    } else {
-        NDN_LOG_INFO("Successfully registered prefix for: "
-                     << Utils::interestPrefix(SystemCalls::open));
-    }
+    if (m_error)
+        return;
 
-    // Filter for close system call
-    m_CloseFilterId = m_face.setInterestFilter(
-        Utils::interestPrefix(SystemCalls::close),
-        bind(&Producer::onCloseInterest, this, _1, _2));
-    if (!m_CloseFilterId) {
-        NDN_LOG_FATAL("Could not set interest filter for close systemcall.");
-    } else {
-        NDN_LOG_INFO("Successfully registered prefix for: "
-                     << Utils::interestPrefix(SystemCalls::close));
-    }
+    // Filter for open system call
+    m_openFilterHandle =
+        m_face.setInterestFilter(xrdndn::SYS_CALL_OPEN_PREFIX_URI,
+                                 bind(&Producer::onOpenInterest, this, _1, _2));
+    NDN_LOG_INFO("Set Interest filter: " << xrdndn::SYS_CALL_OPEN_PREFIX_URI);
 
     // Filter for fstat system call
-    m_FstatFilterId = m_face.setInterestFilter(
-        Utils::interestPrefix(SystemCalls::fstat),
+    m_fstatFilterHandle = m_face.setInterestFilter(
+        xrdndn::SYS_CALL_FSTAT_PREFIX_URI,
         bind(&Producer::onFstatInterest, this, _1, _2));
-    if (!m_FstatFilterId) {
-        NDN_LOG_FATAL("Could not set interest filter for fstat systemcall.");
-    } else {
-        NDN_LOG_INFO("Successfully registered prefix for: "
-                     << Utils::interestPrefix(SystemCalls::fstat));
-    }
+    NDN_LOG_INFO("Set Interest filter: " << xrdndn::SYS_CALL_FSTAT_PREFIX_URI);
 
     // Filter for read system call
-    m_ReadFilterId =
-        m_face.setInterestFilter(Utils::interestPrefix(SystemCalls::read),
+    m_readFilterHandle =
+        m_face.setInterestFilter(xrdndn::SYS_CALL_READ_PREFIX_URI,
                                  bind(&Producer::onReadInterest, this, _1, _2));
-    if (!m_CloseFilterId) {
-        NDN_LOG_FATAL("Could not set interest filter for read systemcall.");
-    } else {
-        NDN_LOG_INFO("Successfully registered prefix for: "
-                     << Utils::interestPrefix(SystemCalls::read));
-    }
+    NDN_LOG_INFO("Set Interest filter: " << xrdndn::SYS_CALL_READ_PREFIX_URI);
 }
 
-void Producer::onGarbageCollector() {
-    boost::unique_lock<boost::shared_mutex>(m_FileHandlers.mutex_);
-    auto it = m_FileHandlers.begin();
-    while (it != m_FileHandlers.end()) {
-        if (it->second->refCount == 0) {
-            NDN_LOG_INFO("Dealloc FileHandler object for file: " << it->first);
-            it = m_FileHandlers.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    m_GarbageCollectorTimer->expires_from_now(std::chrono::seconds(90));
-    m_GarbageCollectorTimer->async_wait(
-        std::bind(&Producer::onGarbageCollector, this));
-}
-
-bool Producer::setFileHandler(std::string path) {
-    if (m_FileHandlers.hasKey(path)) {
-        return true;
-    }
-
-    auto entry = std::make_shared<FileHandler>();
-    auto ret = m_FileHandlers.insert(
-        std::make_pair<std::string &, std::shared_ptr<FileHandler> &>(path,
-                                                                      entry));
-
-    if (!ret.second) {
-        NDN_LOG_ERROR("Failed to create file handler for: " << path);
-        m_FileHandlers.erase(path);
-        return false;
-    }
-    return true;
+void Producer::onData(std::shared_ptr<ndn::Data> data) {
+    NDN_LOG_TRACE("Sending Data: " << data);
+    m_face.put(*data);
 }
 
 void Producer::onOpenInterest(const InterestFilter &,
                               const Interest &interest) {
-    m_face.getIoService().post([&] {
-        NDN_LOG_TRACE("onOpenInterest: " << interest);
-
-        Name name(interest.getName());
-        std::string path =
-            xrdndn::Utils::getFilePathFromName(name, xrdndn::SystemCalls::open);
-
-        std::shared_ptr<Data> data;
-        if (!setFileHandler(path)) {
-            data = m_packager->getPackage(name, XRDNDN_EFAILURE);
-        } else {
-            data = m_FileHandlers.at(path)->getOpenData(name, path);
-        }
-
-        NDN_LOG_TRACE("Sending: " << *data);
-        m_face.put(*data);
-    });
-}
-
-void Producer::onCloseInterest(const InterestFilter &,
-                               const Interest &interest) {
-    m_face.getIoService().post([&] {
-        NDN_LOG_TRACE("onCloseInterest: " << interest);
-        Name name(interest.getName());
-        std::string path = xrdndn::Utils::getFilePathFromName(
-            name, xrdndn::SystemCalls::close);
-
-        std::shared_ptr<Data> data;
-        if (m_FileHandlers.hasKey(path)) {
-            data = m_FileHandlers.at(path)->getCloseData(name, path);
-        } else {
-            data = m_packager->getPackage(name, XRDNDN_ESUCCESS);
-        }
-
-        NDN_LOG_TRACE("Sending: " << *data);
-        m_face.put(*data);
-    });
+    NDN_LOG_TRACE("onOpenInterest: " << interest);
+    m_interestManager->openInterest(interest);
 }
 
 void Producer::onFstatInterest(const ndn::InterestFilter &,
                                const ndn::Interest &interest) {
-    m_face.getIoService().post([&] {
-        NDN_LOG_TRACE("onFstatInterest: " << interest);
-        Name name(interest.getName());
-        std::string path = xrdndn::Utils::getFilePathFromName(
-            name, xrdndn::SystemCalls::fstat);
-
-        std::shared_ptr<Data> data;
-        if (!setFileHandler(path)) {
-            data = m_packager->getPackage(name, XRDNDN_EFAILURE);
-        } else {
-            data = m_FileHandlers.at(path)->getFStatData(name, path);
-        }
-
-        NDN_LOG_TRACE("Sending: " << *data);
-        m_face.put(*data);
-    });
+    NDN_LOG_TRACE("onFstatInterest: " << interest);
+    m_interestManager->fstatInterest(interest);
 }
 
 void Producer::onReadInterest(const InterestFilter &,
                               const Interest &interest) {
-    m_face.getIoService().post([&] {
-        NDN_LOG_TRACE("onReadInterest: " << interest);
-        Name name(interest.getName());
-        std::string path =
-            xrdndn::Utils::getFilePathFromName(name, xrdndn::SystemCalls::read);
-
-        std::shared_ptr<Data> data;
-        if (!setFileHandler(path)) {
-            data = m_packager->getPackage(name, XRDNDN_EFAILURE);
-        } else {
-            data = m_FileHandlers.at(path)->getReadData(
-                xrdndn::Utils::getSegmentFromPacket(interest), name, path);
-        }
-
-        NDN_LOG_TRACE("Sending: " << *data);
-        m_face.put(*data);
-    });
+    NDN_LOG_TRACE("onReadInterest: " << interest);
+    m_interestManager->readInterest(interest);
 }
 } // namespace xrdndnproducer
